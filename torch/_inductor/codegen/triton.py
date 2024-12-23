@@ -2263,6 +2263,25 @@ class TritonKernel(SIMDKernel):
         reduction_type: ReductionType,
         value: Union[CSEVariable, Tuple[CSEVariable, ...]],
     ) -> Union[CSEVariable, Tuple[CSEVariable, ...]]:
+        original_dtypes = [v.dtype for v in value] if isinstance(value, tuple) else [value.dtype]
+        _value = [value] if not isinstance(value, tuple) else value
+        upcasted_value = []
+        for i, v_dtype in enumerate(original_dtypes):
+            if v_dtype in [
+                torch.float16,
+                torch.bfloat16,
+            ]:
+                # Math reductions in FP16/BF16 is less accurate because Triton compiler does not
+                # automatically promote to FP32 for accumulation. Additionally, max/min reudctions
+                # do not support FP16/BF16. We manually promote to FP32 here.
+                upcasted_value.append(ops.to_dtype(_value[i], torch.float32))
+                src_dtype = torch.float32
+                dtype = torch.float32
+            else:
+                upcasted_value.append(_value[i])
+
+        value = upcasted_value[0] if len(upcasted_value) == 1 else tuple(upcasted_value)
+
         assert self.inside_reduction
         masks = OrderedSet(f"{tree.prefix}mask" for tree in self.range_trees)
         self.filter_masks(masks)
@@ -2492,9 +2511,26 @@ class TritonKernel(SIMDKernel):
         if isinstance(result_var, tuple):
             assert all(isinstance(x, TritonCSEVariable) for x in result_var)
             self.outside_loop_vars.update(result_var)
+
+            # Match output dtype with input dtype
+            casted_result_var = []
+            for var, _dtype in zip(result_var, original_dtypes):
+                casted_result_var.append(
+                    ops.to_dtype(result_var, _dtype)
+                    if var.dtype != _dtype
+                    else var
+                )
+            result_var = tuple(casted_result_var)
         else:
             assert isinstance(result_var, TritonCSEVariable)
             self.outside_loop_vars.add(result_var)
+
+            # Match output dtype with input dtype
+            result_var = (
+                ops.to_dtype(result_var, original_dtypes[0])
+                if result_var.dtype != original_dtypes[0]
+                else result_var
+            )
 
         return result_var
 
